@@ -1,85 +1,214 @@
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeSynonymInstances #-}
+
 module Main where
 
-import Data.Char (digitToInt)
+import Control.Monad (MonadPlus, guard)
+import Data.Functor ((<&>))
 import Data.Map (Map)
-import Data.Maybe (fromMaybe)
 import Debug.Trace (trace)
+import GHC.Base (Alternative (empty, (<|>)))
 import System.IO (hFlush, stdout)
-import Control.Monad (when, replicateM_, replicateM)
+
+newtype Parser a = Parser {runParser :: String -> [(a, String)]} deriving (Functor)
+
+instance Monad Parser where
+  return v = Parser $ \inp -> [(v, inp)]
+  p >>= f = Parser $ \inp -> concat [runParser (f v) inp' | (v, inp') <- runParser p inp]
+
+instance Applicative Parser where
+  pure = return
+  p <*> q =
+    do
+      p' <- p
+      p' <$> q
+
+instance Alternative Parser where
+  empty = Parser $ const []
+  p <|> q = Parser $ \inp -> runParser p inp ++ runParser q inp
+
+item :: Parser Char
+item = Parser $ \case
+  "" -> []
+  (x : xs) -> [(x, xs)]
+
+sat :: (Char -> Bool) -> Parser Char
+sat p =
+  do
+    x <- item
+    guard (p x)
+    return x
+
+many :: Parser a -> Parser [a]
+many p =
+  ( do
+      p' <- p
+      ps <- many p
+      return (p' : ps)
+  )
+    <|> return []
+
+many1 :: Parser a -> Parser [a]
+many1 p =
+  do
+    p' <- p
+    ps <- many p
+    return (p' : ps)
+
+char :: Char -> Parser Char
+char c = sat (c ==)
+
+digit :: Parser Char
+digit = sat (`elem` ['0' .. '9'])
+
+onenine :: Parser Char
+onenine = sat (`elem` ['1' .. '9'])
+
+hex :: Parser Char
+hex = digit <|> sat (`elem` ['a' .. 'f']) <|> sat (`elem` ['A' .. 'F'])
+
+ws :: Parser String
+ws = many1 (sat (`elem` ['\x0020', '\x000A', '\x000D', '\x0009'])) <|> return ""
+
+string :: String -> Parser String
+string "" = return ""
+string (x : xs) =
+  do
+    _ <- char x
+    _ <- string xs
+    return (x : xs)
+
+brackets :: Parser a -> Parser b -> Parser c -> Parser b
+brackets a b c = do
+  _ <- a
+  b' <- b
+  _ <- c
+  return b'
+
+sepBy1 :: Parser a -> Parser b -> Parser [a]
+sepBy1 p sep = do
+  p' <- p
+  ps <- many $ sep >> p
+  return (p' : ps)
+
+sepBy :: Parser a -> Parser b -> Parser [a]
+sepBy p sep = sepBy1 p sep <|> return []
+
+sign :: Parser String
+sign = string "+" <|> string "-" <|> return ""
+
+integer :: Parser String
+integer =
+  ( do
+      _ <- char '-'
+      d <- onenine
+      ds <- many1 digit
+      return ('-' : d : ds)
+  )
+    <|> ( do
+            _ <- char '-'
+            d <- digit
+            return ('-' : d : "")
+        )
+    <|> ( do
+            d <- onenine
+            ds <- many1 digit
+            return (d : ds)
+        )
+    <|> (return <$> digit)
+
+fraction :: Parser String
+fraction =
+  ( do
+      _ <- char '.'
+      ds <- many1 digit
+      return ('.' : ds)
+  )
+    <|> return ""
+
+expo :: Parser String
+expo =
+  ( do
+      e <- string "E" <|> string "e"
+      s <- sign
+      ds <- many1 digit
+      return (e ++ s ++ ds)
+  )
+    <|> return ""
+
+escape :: Parser String
+escape =
+  return <$> sat (`elem` ['"', '\\', '/', 'b', 'f', 'n', 'r', 't'])
+    <|> ( do
+            _ <- char 'u'
+            h1 <- hex
+            h2 <- hex
+            h3 <- hex
+            h4 <- hex
+            return ('x' : h1 : h2 : h3 : h4 : "")
+        )
+
+character :: Parser Char
+character =
+  sat (not . (`elem` ['"', '\\']))
+    <|> ( do
+            _ <- char '\\'
+            e <- escape
+            return (read $ "'\\" ++ e ++ "'" :: Char)
+        )
+
+characters :: Parser String
+characters = many character
+
+member :: Parser (String, Json)
+member = do
+  s <- brackets ws parseJString ws
+  _ <- char ':'
+  e <- brackets ws parseJson ws
+  return (getString s, e)
+
+
 
 data Json
   = JNull
-  | JInt {getInt :: Int}
-  | JFloat {getFloat :: Float}
-  | JString {getString :: String}
   | JBoolean {getBoolean :: Bool}
+  | JNumber {getNumber :: Double}
+  | JString {getString :: String}
   | JArray {getArray :: [Json]}
-  | JObject {getObject :: Map String Json}
+  | JObject {getObject :: [(String, Json)]}
   deriving (Show)
 
-consumeChar :: Char -> String -> Maybe (Char, String)
-consumeChar c = consumeAnyOfChars [c]
+parseJNull :: Parser Json
+parseJNull = string "null" >> return JNull
 
-consumeAnyOfChars :: [Char] -> String -> Maybe (Char, String)
-consumeAnyOfChars cs (x:xs)
-  | x `elem` cs = Just (x, xs)
-  | otherwise = Nothing
-consumeAnyOfChars _ _ = Nothing
+parseJBoolean :: Parser Json
+parseJBoolean = JBoolean <$> ((string "true" >> return True) <|> (string "false" >> return False))
 
-parseStringChars :: String -> Maybe (Int, String)
-parseStringChars "" = Nothing
-parseStringChars src@('"':xs) = Just (0, src)
-parseStringChars ('\\':xs) = do
-  (afterSlash, remaining) <- consumeAnyOfChars ['\"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'] xs
-  let matched = 1
-  when (afterSlash == 'u') $ do
-    extra <- replicateM 4 $ do
-      (x, remaining) <- consumeAnyOfChars (['0'..'9'] ++ ['a'..'f'] ++ ['A'..'F']) remaining
-      return x
-    let matched = matched + 1
-    return ()
-  (matchedAfter, remaining) <- parseStringChars xs
-  return (matched + matchedAfter, remaining)
-parseStringChars src@(x:xs) = do
-  (matchedAfter, remaining) <- parseStringChars xs
-  return (1 + matchedAfter, remaining)
+parseJNumber :: Parser Json
+parseJNumber =
+  do
+    i <- integer
+    f <- fraction
+    e <- expo
+    return $ JNumber (read (i ++ f ++ e) :: Double)
 
-parseJNull :: String -> Maybe (Json, String)
-parseJNull ('n':'u':'l':'l':remaining) = Just (JBoolean True, remaining)
-parseJNull _ = Nothing
+parseJString :: Parser Json
+parseJString = JString <$> brackets (char '"') characters (char '"')
 
-parseJInt :: String -> Maybe (Json, String)
-parseJInt "" = Nothing
-parseJInt src = do
-  let (digits, remaining) = span (`elem` ['0'..'9']) src
-  case digits of
-    "" -> Nothing
-    _ -> Just (JInt $ read digits, remaining)
+parseJArray :: Parser Json
+parseJArray =
+  (brackets (char '[') ws (char ']') >> return (JArray []))
+    <|> JArray <$> brackets (char '[') (sepBy (brackets ws parseJson ws) (char ',')) (char ']')
 
-parseJFloat :: String -> Maybe (Json, String)
-parseJFloat src = do
-  (beforeDot, remaining) <- parseJInt src
-  (_, remaining) <- consumeChar '.' remaining
-  (afterDot, remaining) <- parseJInt remaining
-  let joinFloatParts x y = read $ show x ++ "." ++ show y
-  Just (JFloat $ joinFloatParts (getInt beforeDot) (getInt afterDot), remaining)
+parseJObject :: Parser Json
+parseJObject =
+  (brackets (char '{') ws (char '}') >> return (JObject []))
+    <|> JObject <$> brackets (char '{') (sepBy member (char ',')) (char '}')
 
-parseJBoolean :: String -> Maybe (Json, String)
-parseJBoolean ('t':'r':'u':'e':remaining) = Just (JBoolean True, remaining)
-parseJBoolean ('f':'a':'l':'s':'e':remaining) = Just (JBoolean True, remaining)
-parseJBoolean _ = Nothing
-
-parseJString :: String -> Maybe (Json, String)
-parseJString "" = Nothing
-parseJString src = do
-  (_, remaining) <- consumeChar '"' src
-  (numChars, _) <- parseStringChars remaining
-  let (matched, remaining1) = splitAt numChars remaining
-  (_, remaining2) <- consumeChar '"' remaining1
-  return (JString matched, remaining2)
-
-parseJson :: String -> Maybe (Json, String)
-parseJson = parseJString
+parseJson :: Parser Json
+parseJson = parseJNull <|> parseJBoolean <|> parseJNumber <|> parseJString <|> parseJArray <|> parseJObject
 
 prompt :: String -> IO String
 prompt text = do
@@ -90,5 +219,5 @@ prompt text = do
 main :: IO ()
 main = do
   src <- prompt ">>> "
-  let parsed = parseJson src
-  print parsed
+  -- let parsed = parseJson src
+  print $ runParser parseJson src
