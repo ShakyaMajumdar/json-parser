@@ -5,8 +5,8 @@
 
 module Main where
 
-import Control.Monad (MonadPlus, guard)
-import Data.Functor ((<&>))
+import Control.Monad (guard)
+import Data.Functor (($>), (<$))
 import Data.Map (Map)
 import Debug.Trace (trace)
 import GHC.Base (Alternative (empty, (<|>)))
@@ -94,7 +94,7 @@ sepBy1 p sep = do
   return (p' : ps)
 
 sepBy :: Parser a -> Parser b -> Parser [a]
-sepBy p sep = sepBy1 p sep <|> return []
+sepBy p sep = sepBy1 p sep <|> (ws $> [])
 
 sign :: Parser String
 sign = string "+" <|> string "-" <|> return ""
@@ -138,6 +138,14 @@ expo =
   )
     <|> return ""
 
+number :: Parser Double
+number =
+  do
+    i <- integer
+    f <- fraction
+    e <- expo
+    return (read (i ++ f ++ e) :: Double)
+
 escape :: Parser String
 escape =
   return <$> sat (`elem` ['"', '\\', '/', 'b', 'f', 'n', 'r', 't'])
@@ -169,7 +177,8 @@ member = do
   e <- brackets ws parseJson ws
   return (getString s, e)
 
-
+element :: Parser Json
+element = brackets ws parseJson ws
 
 data Json
   = JNull
@@ -181,31 +190,22 @@ data Json
   deriving (Show)
 
 parseJNull :: Parser Json
-parseJNull = string "null" >> return JNull
+parseJNull = JNull <$ string "null"
 
 parseJBoolean :: Parser Json
-parseJBoolean = JBoolean <$> ((string "true" >> return True) <|> (string "false" >> return False))
+parseJBoolean = JBoolean <$> ((True <$ string "true") <|> (False <$ string "false"))
 
 parseJNumber :: Parser Json
-parseJNumber =
-  do
-    i <- integer
-    f <- fraction
-    e <- expo
-    return $ JNumber (read (i ++ f ++ e) :: Double)
+parseJNumber = JNumber <$> number
 
 parseJString :: Parser Json
 parseJString = JString <$> brackets (char '"') characters (char '"')
 
 parseJArray :: Parser Json
-parseJArray =
-  (brackets (char '[') ws (char ']') >> return (JArray []))
-    <|> JArray <$> brackets (char '[') (sepBy (brackets ws parseJson ws) (char ',')) (char ']')
+parseJArray = JArray <$> brackets (char '[') (element `sepBy` char ',') (char ']')
 
 parseJObject :: Parser Json
-parseJObject =
-  (brackets (char '{') ws (char '}') >> return (JObject []))
-    <|> JObject <$> brackets (char '{') (sepBy member (char ',')) (char '}')
+parseJObject = JObject <$> brackets (char '{') (member `sepBy` char ',') (char '}')
 
 parseJson :: Parser Json
 parseJson = parseJNull <|> parseJBoolean <|> parseJNumber <|> parseJString <|> parseJArray <|> parseJObject
@@ -219,5 +219,4 @@ prompt text = do
 main :: IO ()
 main = do
   src <- prompt ">>> "
-  -- let parsed = parseJson src
   print $ runParser parseJson src
